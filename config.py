@@ -18,8 +18,13 @@ INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", 313))
 # Set per order via Delta API before each trade
 LEVERAGE = int(os.getenv("LEVERAGE", 5))
 
-ENTRY_START_HOUR = int(os.getenv("ENTRY_START_HOUR", 7))
-ENTRY_END_HOUR   = int(os.getenv("ENTRY_END_HOUR", 9))
+# 24-hour research mode — one strangle per hour, all day
+# MAX_CONCURRENT_STRANGLES: cap on open positions at once (capital safety)
+MAX_CONCURRENT_STRANGLES = int(os.getenv("MAX_CONCURRENT_STRANGLES", 4))
+
+# Legacy entry window (not used in 24-hour mode)
+ENTRY_START_HOUR = int(os.getenv("ENTRY_START_HOUR", 0))
+ENTRY_END_HOUR   = int(os.getenv("ENTRY_END_HOUR", 23))
 
 # Exit rules: premium-based (not underlying price)
 STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", 100))  # 2x premium

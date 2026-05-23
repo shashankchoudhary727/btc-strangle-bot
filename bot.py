@@ -8,8 +8,9 @@ from config import (
     TRADE_MODE,
     INITIAL_CAPITAL,
     UNDERLYING,
-    TRAILING_SL_ACTIVATION_PCT,   # profit % at which trailing kicks in
-    TRAILING_SL_DISTANCE_PCT,     # how far behind the best profit the SL trails
+    TRAILING_SL_ACTIVATION_PCT,
+    TRAILING_SL_DISTANCE_PCT,
+    MAX_CONCURRENT_STRANGLES,
 )
 
 from strategy import OptionSellingStrategy
@@ -27,21 +28,23 @@ api      = DeltaAPI()
 feed = LivePriceFeed(symbol=SYMBOL)
 feed.start()
 
-capital         = INITIAL_CAPITAL
-last_trade_date = None          # one entry per calendar day
+capital = INITIAL_CAPITAL
 
-# Short strangle — two legs
-call_leg = None
-put_leg  = None
+# 24-hour mode: track which hours have already been entered
+# Key: (date, hour) → True once a strangle is opened in that hour
+entered_hours = set()
 
-def legs_active():
-    return call_leg is not None or put_leg is not None
+# Active strangles: list of {call_leg, put_leg, entry_hour}
+# One per hour — up to MAX_CONCURRENT_STRANGLES open at once
+active_strangles = []
 
 print("=" * 60)
-print(f"TRADE MODE      : {TRADE_MODE}")
-print(f"INITIAL CAPITAL : ${capital:.2f} USDT")
-print(f"SYMBOL          : {SYMBOL}")
-print(f"UNDERLYING      : {UNDERLYING}")
+print(f"TRADE MODE            : {TRADE_MODE}")
+print(f"INITIAL CAPITAL       : ${capital:.2f} USDT")
+print(f"SYMBOL                : {SYMBOL}")
+print(f"UNDERLYING            : {UNDERLYING}")
+print(f"MAX OPEN STRANGLES    : {MAX_CONCURRENT_STRANGLES}")
+print(f"MODE                  : 24-HOUR (one entry per hour)")
 print("=" * 60)
 
 # Wait for WebSocket
@@ -53,38 +56,28 @@ while not feed.connected:
 #  Helpers
 # ------------------------------------------------------------------ #
 def make_leg(info):
-    """Build a leg dict with trailing SL fields initialised."""
     entry = info["mark_price"]
     return {
-        "product_id":    info["product_id"],
-        "symbol":        info["symbol"],
-        "entry_premium": entry,
-        "stop_loss":     strategy.calculate_stop_loss(entry),   # hard SL (2x)
-        "target":        strategy.calculate_target(entry),       # target (5% of entry)
-        "exited":        False,
-        # --- trailing stop loss tracking ---
-        "best_pnl_pct":  0.0,    # highest % profit seen so far (positive = profit)
-        "trailing_sl":   None,   # None = trailing not yet activated
+        "product_id":         info["product_id"],
+        "symbol":             info["symbol"],
+        "entry_premium":      entry,
+        "stop_loss":          strategy.calculate_stop_loss(entry),
+        "target":             strategy.calculate_target(entry),
+        "exited":             False,
+        "best_pnl_pct":       0.0,
+        "trailing_sl":        None,
+        "last_known_premium": entry,
+        "exit_reason":        None,
     }
 
 def update_trailing_sl(leg, pnl_pct):
-    """
-    Trailing SL logic:
-    - Activates when profit reaches TRAILING_SL_ACTIVATION_PCT (e.g. 40%)
-    - Trails TRAILING_SL_DISTANCE_PCT (e.g. 15%) behind the best profit seen
-    - Once activated, acts as a floor — if profit falls back by that distance, exit
-    - Returns updated leg dict
-    """
     if pnl_pct > leg["best_pnl_pct"]:
         leg["best_pnl_pct"] = pnl_pct
 
-    # Activate trailing once profit crosses the activation threshold
     if leg["best_pnl_pct"] >= TRAILING_SL_ACTIVATION_PCT:
-        trailing_floor = leg["best_pnl_pct"] - TRAILING_SL_DISTANCE_PCT
-        # Express trailing floor as a premium price
-        # pnl_pct = ((entry - live) / entry) * 100  =>  live = entry * (1 - floor/100)
+        trailing_floor   = leg["best_pnl_pct"] - TRAILING_SL_DISTANCE_PCT
         trailing_premium = leg["entry_premium"] * (1 - trailing_floor / 100)
-        leg["trailing_sl"] = trailing_premium   # always ratchet upward (lower premium)
+        leg["trailing_sl"] = trailing_premium
 
     return leg
 
@@ -95,6 +88,81 @@ def format_balance(balance: dict) -> str:
         f"Total: ${balance['total']:.2f}"
     )
 
+def process_leg(leg, leg_name, entry_hour):
+    """Monitor one leg. Returns updated leg."""
+    if leg is None or leg["exited"]:
+        return leg
+
+    live_premium = api.get_option_mark_price(leg["symbol"])
+    if live_premium == 0.0:
+        live_premium = leg["last_known_premium"]
+        print(f"  {leg_name} | WARNING: mark price 0 — using last known ${live_premium:.2f}")
+    else:
+        leg["last_known_premium"] = live_premium
+
+    pnl_pct = ((leg["entry_premium"] - live_premium) / leg["entry_premium"]) * 100
+    leg     = update_trailing_sl(leg, pnl_pct)
+
+    effective_sl  = leg["stop_loss"]
+    trailing_tag  = ""
+    if leg["trailing_sl"] is not None:
+        effective_sl = min(leg["stop_loss"], leg["trailing_sl"])
+        trailing_tag = f" [TSL: ${leg['trailing_sl']:.2f} | Peak: {leg['best_pnl_pct']:.1f}%]"
+
+    print(
+        f"  {leg_name} | {leg['symbol']} | "
+        f"Entry: ${leg['entry_premium']:.2f} | "
+        f"Live: ${live_premium:.2f} | "
+        f"PnL%: {pnl_pct:.1f}% | "
+        f"SL: ${effective_sl:.2f} | "
+        f"Target: ${leg['target']:.2f}"
+        f"{trailing_tag}"
+    )
+
+    if strategy.should_exit_trade(live_premium, effective_sl, leg["target"]):
+        if TRADE_MODE == "PAPER":
+            exit_resp = {"success": True}
+        else:
+            exit_resp = api.place_market_order(
+                product_id=leg["product_id"],
+                size=LOT_SIZE, side="buy"
+            )
+
+        if exit_resp:
+            global capital
+            pnl = (leg["entry_premium"] - live_premium) * LOT_SIZE
+            capital += pnl
+
+            exit_reason = (
+                "TARGET"      if live_premium <= leg["target"] else
+                "TRAILING SL" if leg["trailing_sl"] and live_premium >= leg["trailing_sl"] else
+                "HARD SL"
+            )
+            leg["exit_reason"] = exit_reason
+
+            balance_after = api.get_wallet_balance()
+
+            logger.log_trade(
+                trade_mode  = TRADE_MODE,
+                symbol      = leg["symbol"],
+                side        = "SELL",
+                entry_hour  = entry_hour,
+                entry_price = leg["entry_premium"],
+                exit_price  = live_premium,
+                quantity    = LOT_SIZE,
+                stop_loss   = leg["stop_loss"],
+                target      = leg["target"],
+                pnl         = pnl,
+                capital     = capital,
+                exit_reason = exit_reason,
+            )
+
+            print(f"  {leg_name} CLOSED | {exit_reason} | Exit: ${live_premium:.2f} | PnL: ${pnl:.2f} | Capital: ${capital:.2f}")
+            print(f"  WALLET | {format_balance(balance_after)}")
+            leg["exited"] = True
+
+    return leg
+
 # ------------------------------------------------------------------ #
 #  Main loop
 # ------------------------------------------------------------------ #
@@ -103,6 +171,7 @@ while True:
         now           = datetime.now()
         current_hour  = now.hour
         today         = date.today()
+        hour_key      = (today, current_hour)
         current_price = feed.current_price
 
         if current_price is None:
@@ -111,171 +180,122 @@ while True:
             continue
 
         # ---------------------------------------------------------- #
-        #  ENTRY — no open legs + entry window + not already traded
+        #  ENTRY — once per hour, if slot not already taken
         # ---------------------------------------------------------- #
-        if not legs_active():
+        if hour_key not in entered_hours:
+            if len(active_strangles) < MAX_CONCURRENT_STRANGLES:
 
-            if last_trade_date == today:
-                print(f"Already traded today ({today}). Waiting for next session.")
-                time.sleep(CHECK_INTERVAL)
-                continue
+                print("=" * 60)
+                print(f"NEW HOUR [{current_hour:02d}:xx] — entering strangle #{len(active_strangles)+1}")
 
-            if strategy.should_enter_trade(current_hour):
-                print("ENTRY CONDITION MET — scanning options chain...")
-
-                # Fetch wallet balance before entry
                 balance = api.get_wallet_balance()
-                print("=" * 60)
                 print(f"WALLET BEFORE ENTRY | {format_balance(balance)}")
-                print("=" * 60)
 
                 chain   = api.get_options_chain(underlying=UNDERLYING)
                 strikes = strategy.scan_strikes(chain, current_price)
 
                 if strikes is None:
-                    print("No suitable strikes found. Will retry next interval.")
+                    print("No suitable strikes found — skipping this hour.")
+                    entered_hours.add(hour_key)     # mark as attempted so we don't retry
                     time.sleep(CHECK_INTERVAL)
                     continue
 
                 call_info = strikes["call"]
                 put_info  = strikes["put"]
 
-                # Place orders (or simulate in PAPER mode)
                 if TRADE_MODE == "PAPER":
-                    print("PAPER TRADE — simulating both legs")
                     call_order = {"success": True}
                     put_order  = {"success": True}
                 else:
-                    print("LIVE TRADE — setting leverage and placing sell orders")
                     api.set_leverage(call_info["product_id"])
                     api.set_leverage(put_info["product_id"])
                     call_order = api.place_market_order(
-                        product_id=call_info["product_id"],
-                        size=LOT_SIZE, side="sell"
+                        product_id=call_info["product_id"], size=LOT_SIZE, side="sell"
                     )
                     put_order = api.place_market_order(
-                        product_id=put_info["product_id"],
-                        size=LOT_SIZE, side="sell"
+                        product_id=put_info["product_id"],  size=LOT_SIZE, side="sell"
                     )
 
                 if call_order and put_order:
-                    call_leg = make_leg(call_info)
-                    put_leg  = make_leg(put_info)
-                    last_trade_date = today
+                    strangle = {
+                        "call_leg":   make_leg(call_info),
+                        "put_leg":    make_leg(put_info),
+                        "entry_hour": current_hour,
+                        "entry_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    active_strangles.append(strangle)
+                    entered_hours.add(hour_key)
 
-                    # Balance snapshot at entry
                     balance_at_entry = api.get_wallet_balance()
-
-                    print("=" * 60)
-                    print("STRANGLE ENTERED")
-                    print(f"CALL | {call_leg['symbol']} | Entry: ${call_leg['entry_premium']:.2f} | SL: ${call_leg['stop_loss']:.2f} | Target: ${call_leg['target']:.2f}")
-                    print(f"PUT  | {put_leg['symbol']}  | Entry: ${put_leg['entry_premium']:.2f} | SL: ${put_leg['stop_loss']:.2f} | Target: ${put_leg['target']:.2f}")
+                    print(f"STRANGLE ENTERED @ Hour {current_hour:02d}")
+                    print(f"  CALL | {strangle['call_leg']['symbol']} | Entry: ${strangle['call_leg']['entry_premium']:.2f}")
+                    print(f"  PUT  | {strangle['put_leg']['symbol']}  | Entry: ${strangle['put_leg']['entry_premium']:.2f}")
                     print(f"WALLET AT ENTRY | {format_balance(balance_at_entry)}")
                     print("=" * 60)
 
+            else:
+                print(f"Hour {current_hour:02d} — max concurrent strangles ({MAX_CONCURRENT_STRANGLES}) reached. Waiting for exits.")
+
         # ---------------------------------------------------------- #
-        #  MONITOR + EXIT — manage each leg independently
+        #  MONITOR all active strangles
         # ---------------------------------------------------------- #
-        else:
+        if active_strangles:
             print("=" * 60)
-            print(f"MONITORING OPEN STRANGLE  |  Underlying: ${current_price:,.2f}")
-            print("=" * 60)
-
-            def exit_leg(leg, leg_name):
-                if leg is None or leg["exited"]:
-                    return leg
-
-                # ---- FIX: fetch LIVE premium from Delta API ----
-                live_premium = api.get_option_mark_price(leg["symbol"])
-                if live_premium == 0.0:
-                    # Fallback: keep last known value, don't exit on bad data
-                    live_premium = leg.get("last_known_premium", leg["entry_premium"])
-                    print(f"{leg_name} | WARNING: mark price returned 0 — using last known ${live_premium:.2f}")
-                else:
-                    leg["last_known_premium"] = live_premium
-
-                pnl_pct = ((leg["entry_premium"] - live_premium) / leg["entry_premium"]) * 100
-
-                # ---- Update trailing SL ----
-                leg = update_trailing_sl(leg, pnl_pct)
-
-                # Effective SL: tighter of hard SL or trailing SL
-                effective_sl = leg["stop_loss"]
-                trailing_tag = ""
-                if leg["trailing_sl"] is not None:
-                    effective_sl = min(leg["stop_loss"], leg["trailing_sl"])
-                    trailing_tag = f" [Trailing: ${leg['trailing_sl']:.2f} | Best: {leg['best_pnl_pct']:.1f}%]"
-
-                print(
-                    f"{leg_name} | {leg['symbol']} | "
-                    f"Entry: ${leg['entry_premium']:.2f} | "
-                    f"Live: ${live_premium:.2f} | "
-                    f"PnL%: {pnl_pct:.1f}% | "
-                    f"Hard SL: ${leg['stop_loss']:.2f} | "
-                    f"Target: ${leg['target']:.2f}"
-                    f"{trailing_tag}"
-                )
-
-                # Exit check (uses effective SL)
-                if strategy.should_exit_trade(live_premium, effective_sl, leg["target"]):
-
-                    if TRADE_MODE == "PAPER":
-                        print(f"PAPER EXIT — {leg_name}")
-                        exit_resp = {"success": True}
-                    else:
-                        print(f"LIVE EXIT — {leg_name}")
-                        exit_resp = api.place_market_order(
-                            product_id=leg["product_id"],
-                            size=LOT_SIZE, side="buy"
-                        )
-
-                    if exit_resp:
-                        pnl = (leg["entry_premium"] - live_premium) * LOT_SIZE
-
-                        global capital
-                        capital += pnl
-
-                        # Balance after exit
-                        balance_after = api.get_wallet_balance()
-
-                        logger.log_trade(
-                            trade_mode=TRADE_MODE,
-                            symbol=leg["symbol"],
-                            side="SELL",
-                            entry_price=leg["entry_premium"],
-                            exit_price=live_premium,
-                            quantity=LOT_SIZE,
-                            stop_loss=leg["stop_loss"],
-                            target=leg["target"],
-                            pnl=pnl,
-                            capital=capital
-                        )
-
-                        exit_reason = "TARGET" if live_premium <= leg["target"] else \
-                                      ("TRAILING SL" if leg["trailing_sl"] and live_premium >= leg["trailing_sl"] else "HARD SL")
-
-                        print(f"{leg_name} CLOSED | Reason: {exit_reason} | Exit: ${live_premium:.2f} | PnL: ${pnl:.2f} | Capital: ${capital:.2f}")
-                        print(f"WALLET AFTER EXIT | {format_balance(balance_after)}")
-                        leg["exited"] = True
-
-                return leg
-
-            call_leg = exit_leg(call_leg, "CALL")
-            put_leg  = exit_leg(put_leg,  "PUT")
+            print(f"MONITORING {len(active_strangles)} STRANGLE(S) | BTC: ${current_price:,.2f}")
             print("=" * 60)
 
-            # Clear legs only when BOTH have exited
-            if call_leg["exited"] and put_leg["exited"]:
-                print("BOTH LEGS CLOSED — strangle complete.")
-                print("Auto-shutting down. Check trades.csv for results.")
-                # Log final capital
+            completed = []
+            for i, strangle in enumerate(active_strangles):
+                h = strangle["entry_hour"]
+                print(f"--- Strangle #{i+1} (entered Hour {h:02d}) ---")
+
+                strangle["call_leg"] = process_leg(strangle["call_leg"], "CALL", h)
+                strangle["put_leg"]  = process_leg(strangle["put_leg"],  "PUT",  h)
+
+                if strangle["call_leg"]["exited"] and strangle["put_leg"]["exited"]:
+                    print(f"--- Strangle #{i+1} (Hour {h:02d}) COMPLETE ---")
+                    completed.append(i)
+
+            # Remove completed strangles (reverse order to preserve indices)
+            for i in reversed(completed):
+                active_strangles.pop(i)
+
+            # Auto-shutdown: all 24 hours attempted AND no open strangles
+            if len(entered_hours) >= 24 and not active_strangles:
+                print("=" * 60)
+                print("ALL 24 HOURLY STRANGLES COMPLETE.")
                 print(f"FINAL CAPITAL : ${capital:.2f} USDT")
+                print("Check trades.csv for full analysis.")
+                print("=" * 60)
                 break
 
         time.sleep(CHECK_INTERVAL)
 
     except KeyboardInterrupt:
-        print("BOT STOPPED MANUALLY")
+        print("\nBOT STOPPED MANUALLY")
+        # Save any open legs at last known price
+        for strangle in active_strangles:
+            for leg, name in [(strangle["call_leg"], "CALL"), (strangle["put_leg"], "PUT")]:
+                if leg and not leg["exited"]:
+                    live = leg["last_known_premium"]
+                    pnl  = (leg["entry_premium"] - live) * LOT_SIZE
+                    capital += pnl
+                    logger.log_trade(
+                        trade_mode  = TRADE_MODE,
+                        symbol      = leg["symbol"],
+                        side        = "SELL",
+                        entry_hour  = strangle["entry_hour"],
+                        entry_price = leg["entry_premium"],
+                        exit_price  = live,
+                        quantity    = LOT_SIZE,
+                        stop_loss   = leg["stop_loss"],
+                        target      = leg["target"],
+                        pnl         = pnl,
+                        capital     = capital,
+                        exit_reason = "MANUAL EXIT",
+                    )
+                    print(f"{name} (Hour {strangle['entry_hour']:02d}) manually closed — logged at ${live:.2f} | PnL: ${pnl:.2f}")
+        print(f"FINAL CAPITAL : ${capital:.2f} USDT")
         break
 
     except Exception as e:
