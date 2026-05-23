@@ -267,8 +267,10 @@ while True:
             # Clear legs only when BOTH have exited
             if call_leg["exited"] and put_leg["exited"]:
                 print("BOTH LEGS CLOSED — strangle complete.")
-                call_leg = None
-                put_leg  = None
+                print("Auto-shutting down. Check trades.csv for results.")
+                # Log final capital
+                print(f"FINAL CAPITAL : ${capital:.2f} USDT")
+                break
 
         time.sleep(CHECK_INTERVAL)
 
