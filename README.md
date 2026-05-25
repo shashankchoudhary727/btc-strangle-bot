@@ -1,202 +1,238 @@
-# Crypto Options Bot — Deployment Guide
-### Short Strangle on BTC Options | Delta Exchange | Paper Trading
+# BTC Short Strangle Bot 🤖
+
+An automated options trading bot that runs short strangle strategies on BTC
+options via Delta Exchange. Built in Python, runs 24/7 on a VPS, and designed
+for systematic data collection and strategy validation.
+
+> ⚠️ This bot is currently in **paper trading mode** — using live market data
+> with simulated execution. Not financial advice. Trade at your own risk.
 
 ---
 
-## One-Time Setup (do this today, takes 15 minutes)
+## What It Does
 
-### Step 1 — Push code to GitHub
+The bot automatically:
+- Scans the Delta Exchange options chain every hour
+- Identifies OTM call and put contracts with premium closest to $100/leg
+- Enters a short strangle (sells both legs simultaneously)
+- Monitors positions in real-time via WebSocket + ticker polling
+- Exits based on predefined rules — no manual intervention needed
+- Logs every trade to `trades.csv` for analysis
 
-1. Go to [github.com](https://github.com) → Sign in / Create free account
-2. Click **New Repository**
-   - Name: `crypto-options-bot`
-   - Set to **Private** (your API keys are in .env — never make this public)
-   - Click **Create repository**
-3. On your PC, open terminal in your bot folder and run:
+One strangle per hour. 24 strangles per day. Fully automated.
+
+---
+
+## Strategy Logic
+
+| Parameter                  | Value                        |
+|----------------------------|------------------------------|
+| Instrument                 | BTC Options — Delta Exchange |
+| Structure                  | Short Strangle (OTM Call + OTM Put) |
+| Expiry                     | Tomorrow's expiry only       |
+| Entry Frequency            | Once per hour (00:00 to 23:00 UTC) |
+| Target Premium             | ~$100 per leg                |
+| Profit Target              | 95% premium decay            |
+| Hard Stop Loss             | 1.5x entry premium           |
+| Trailing SL Activation     | 40% profit on leg            |
+| Trailing SL Trail          | 15% behind peak profit       |
+| Max Concurrent Strangles   | 4 (capital safety guard)     |
+| Leverage                   | 2x                           |
+
+---
+
+## Tech Stack
+
+- **Language:** Python 3.10+
+- **Exchange:** Delta Exchange (Crypto Options)
+- **Data:** Live market data via Delta REST API + WebSocket
+- **Execution:** Paper trading (simulated fills, real prices)
+- **Infrastructure:** Hostinger VPS — Ubuntu 24.04 LTS
+- **Storage:** CSV-based trade logging
+
+---
+
+## Project Structure
+
+```
+btc-strangle-bot/
+├── bot.py                 # Main entry point — orchestrates the loop
+├── strategy.py            # Entry/exit logic, SL calculations
+├── delta_api.py           # Delta Exchange REST API wrapper
+├── websocket_handler.py   # Real-time price feed via WebSocket
+├── config.py              # Configuration loader
+├── logger.py              # Trade logging to trades.csv
+├── debug_chain.py         # Options chain debugging utility
+├── .env.example           # Environment variable template
+├── config.json            # Strategy parameters
+├── trades.csv             # Auto-generated trade log
+└── README.md
+```
+
+---
+
+## Installation
+
+### Prerequisites
+
+- Python 3.10 or higher
+- A Delta Exchange account (testnet or live)
+- API key and secret from Delta Exchange
+- A Linux VPS or local machine (Ubuntu recommended)
+
+### Step 1 — Clone the Repository
 
 ```bash
-git init
-git add .
-git commit -m "initial bot setup"
-git remote add origin https://github.com/YOUR_USERNAME/crypto-options-bot.git
-git push -u origin main
+git clone https://github.com/shashankchoudhary727/btc-strangle-bot.git
+cd btc-strangle-bot
 ```
 
-> Replace `YOUR_USERNAME` with your actual GitHub username.
-
----
-
-### Step 2 — Add your API keys as Codespace Secrets (IMPORTANT)
-
-Never push your real `.env` file with API keys to GitHub.
-
-1. Go to: **github.com → Settings → Codespaces → Secrets**
-2. Add these secrets one by one:
-
-| Secret Name | Value |
-|---|---|
-| `DELTA_API_KEY` | your Delta Exchange API key |
-| `DELTA_API_SECRET` | your Delta Exchange API secret |
-
-These will be auto-injected into your Codespace as environment variables.
-
----
-
-### Step 3 — Add .env to .gitignore
-
-Create a file called `.gitignore` in your bot folder with this content:
-
-```
-.env
-__pycache__/
-*.pyc
-.refact/
-```
-
-This prevents your `.env` from ever being pushed to GitHub.
-
----
-
-## Every Morning (6:30 AM routine)
-
-### Step 4 — Open Codespace
-
-1. Go to **github.com/YOUR_USERNAME/crypto-options-bot**
-2. Click green **Code** button → **Codespaces** tab
-3. Click **Create codespace on main** (first time) or open existing one
-4. Wait ~30 seconds for it to load — you get a full VS Code in the browser
-
----
-
-### Step 5 — Install dependencies (first time only)
-
-In the Codespace terminal at the bottom:
+### Step 2 — Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
-
-### Step 6 — Set your API keys in the Codespace terminal
-
-Since your `.env` is gitignored, run this once per new Codespace session:
+### Step 3 — Configure Environment Variables
 
 ```bash
 cp .env.example .env
+nano .env
 ```
 
-Then open `.env` in the editor and paste your API keys.
+Fill in your credentials:
 
-**OR** if you set Codespace Secrets in Step 2, just run:
+```
+DELTA_API_KEY=your_api_key_here
+DELTA_API_SECRET=your_api_secret_here
+```
 
+### Step 4 — Configure Strategy Parameters
+
+Edit `config.json` to adjust strategy settings:
+
+```json
+{
+  "target_premium": 100,
+  "profit_target_pct": 0.95,
+  "hard_sl_multiplier": 1.5,
+  "trailing_sl_activation_pct": 0.40,
+  "trailing_sl_trail_pct": 0.15,
+  "max_concurrent_strangles": 4,
+  "leverage": 2
+}
+```
+
+### Step 5 — Run the Bot
+
+**Locally:**
 ```bash
-echo "DELTA_API_KEY=$DELTA_API_KEY" >> .env
-echo "DELTA_API_SECRET=$DELTA_API_SECRET" >> .env
+python3 bot.py
 ```
 
----
-
-### Step 7 — Run the bot
-
+**On VPS (runs after terminal close):**
 ```bash
-python bot.py
+nohup python3 bot.py > bot_log.txt 2>&1 &
 ```
 
-You will see:
-```
-============================================================
-TRADE MODE      : PAPER
-INITIAL CAPITAL : $313.00 USDT
-SYMBOL          : BTCUSDT
-UNDERLYING      : BTC
-============================================================
-Waiting for WebSocket connection...
-LIVE PRICE : 75524.31
-```
-
-Bot is now live. Entry will trigger automatically between 7-9 AM IST.
-
----
-
-### Step 8 — Monitor from your phone
-
-Once running, you can:
-- Close the laptop — Codespace keeps running in the cloud
-- Reopen github.com on phone browser → your Codespace → see the terminal
-
----
-
-### Step 9 — Download your trades.csv after session
-
-After the bot runs and exits (or you Ctrl+C after 9 AM):
-
+**Check live logs:**
 ```bash
-# In Codespace terminal — check your trades
-cat trades.csv
+tail -f bot_log.txt
 ```
 
-To download:
-1. Right-click `trades.csv` in the file explorer panel on the left
-2. Click **Download**
-3. Open in Excel or Google Sheets for analysis
+**Stop the bot:**
+```bash
+kill $(pgrep -f bot.py)
+```
 
 ---
 
-## Codespace Free Tier Limits
+## Trade Logging
 
-| Limit | Amount |
-|---|---|
-| Free hours/month | 60 hours |
-| Your daily session | ~2 hours (7-9 AM) |
-| Sessions per month | ~30 sessions free |
-| Storage | 15 GB |
+Every entry and exit is automatically logged to `trades.csv`:
 
-**You will never hit the limit for paper trading.**
+| Column         | Description                                      |
+|----------------|--------------------------------------------------|
+| timestamp      | UTC time of the event                            |
+| entry_hour     | Which hourly cycle (0–23)                        |
+| leg            | call or put                                      |
+| entry_premium  | Premium collected at entry ($)                   |
+| exit_premium   | Premium at exit ($)                              |
+| pnl            | Realized PnL for the leg ($)                     |
+| exit_reason    | target / hard_sl / trailing_sl / manual          |
 
----
-
-## Troubleshooting
-
-**Bot says "Waiting for WebSocket connection" forever**
-→ Delta Exchange API might be down. Check [status.delta.exchange](https://status.delta.exchange)
-
-**No strikes found during entry window**
-→ Run `python debug_chain.py` to see what the options chain is returning
-
-**Codespace disconnects / times out**
-→ Just reopen it from github.com — your files are saved, just re-run `python bot.py`
-
-**trades.csv is empty**
-→ No trade triggered yet (entry window may have passed) or bot was stopped before any exit
+**Download trades from VPS to local machine:**
+```bash
+scp root@YOUR_VPS_IP:/root/btc-strangle-bot/trades.csv C:\Users\YourName\Desktop\trades.csv
+```
 
 ---
 
-## Files Reference
+## Improving Bot Performance
 
-| File | Purpose |
-|---|---|
-| `bot.py` | Main loop — entry, monitoring, exit |
-| `delta_api.py` | All Delta Exchange API calls |
-| `strategy.py` | Entry/exit logic, strike selection |
-| `websocket_handler.py` | Live BTC price feed |
-| `config.py` | All settings loaded from .env |
-| `logger.py` | Writes trades to trades.csv |
-| `debug_chain.py` | Test options chain fetch without running full bot |
-| `.env` | Your private config — never push to GitHub |
-| `trades.csv` | Paper trade log — your analysis data |
+These are the levers available to tune strategy behavior:
+
+**1. Adjust Target Premium**
+The bot targets ~$100/leg. In low volatility environments, this may be hard
+to fill cleanly. You can lower `target_premium` to $70–80 to increase fill
+frequency at the cost of lower premium collected per trade.
+
+**2. Tighten or Loosen Hard SL**
+Currently set at 1.5x entry premium. A tighter SL (1.2x) reduces max loss
+per leg but increases the chance of getting stopped out on normal fluctuations.
+A looser SL (2x) gives more room but increases drawdown risk.
+
+**3. Trailing SL Activation Threshold**
+Currently activates at 40% profit. Activating earlier (25–30%) locks in
+profit sooner but may exit too early on legs that would have hit 95% decay.
+Activating later (50–60%) lets winners run but gives back more profit if
+market reverses.
+
+**4. Skip High-Volatility Hours**
+If data over multiple sessions shows consistent Hard SL hits during specific
+UTC hours (e.g., US market open, major news windows), those hours can be
+excluded by adding a `no_trade_hours` list to `config.json`.
+
+**5. Expiry Selection**
+Bot currently targets tomorrow's expiry only. Shorter expiries have faster
+decay (good for this strategy) but less liquidity. This is a parameter worth
+monitoring over time.
 
 ---
 
-## Current Strategy Settings
+## Risk Disclosure
 
-| Parameter | Value | Meaning |
-|---|---|---|
-| Entry window | 7–9 AM IST | Only enters during this window |
-| Target premium | ~$100 per leg | Sells OTM strike closest to $100 |
-| Stop loss | 1.5x premium | Exit if premium rises 50% |
-| Target | 95% decay | Exit if premium falls to 5% of entry |
-| Trailing SL activates | 40% profit | Locks in gains once 40% profit hit |
-| Trailing SL distance | 15% | Trails 15% behind peak profit |
-| Leverage | 2x | Conservative — paper mode only |
-| Capital | $313 USDT | ₹30,000 equivalent |
+- **This is not financial advice.** This bot is a research and automation tool.
+- Short strangles carry **unlimited loss potential** on the call side in theory.
+  Hard SL and max concurrent position limits exist to contain this.
+- Crypto options markets are **highly volatile** and can gap through stop levels.
+- The bot is in **paper trading mode** — it does not place real orders or touch
+  real capital in its current state.
+- Past paper trading results do not guarantee live trading performance.
+- Never allocate capital you cannot afford to lose entirely.
+
+---
+
+## Current Status
+
+| Metric        | Value           |
+|---------------|-----------------|
+| Mode          | Paper Trading   |
+| Live Since    | May 24, 2025    |
+| Days of Data  | Ongoing         |
+| Bot Uptime    | 24/7 on VPS     |
+
+*Results and analysis will be published as data accumulates.*
+
+---
+
+## Author
+
+**Shanks** — Project Manager by day, algo trader by night.
+Building this in public on YouTube: [Mindset2Money](https://youtube.com/@Mindset2Money)
+
+---
+
+## License
+
+MIT License — use freely, modify openly, trade responsibly.
