@@ -1,4 +1,0 @@
-requests
-websocket-client
-python-dotenv
-pandas
